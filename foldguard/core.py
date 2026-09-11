@@ -91,6 +91,14 @@ def _validate_plddt(residues: list[Residue], source: str) -> None:
     """
     values = [r.plddt for r in residues]
 
+    non_finite = [v for v in values if not math.isfinite(v)]
+    if non_finite:
+        raise ParseError(
+            f"{source} has confidence values that are not a number (NaN or "
+            "infinity). Comparisons against them are all false, so every "
+            "threshold check would silently pass."
+        )
+
     out_of_range = [v for v in values if v < PLDDT_MIN or v > PLDDT_MAX]
     if out_of_range:
         raise ParseError(
@@ -467,6 +475,13 @@ def _parse_cif(text: str, source: str) -> list[Residue]:
         if len(parts) < len(headers):
             continue
         row = dict(zip(headers, parts))
+        # A calcium ion is label_atom_id 'CA', identical to an alpha carbon.
+        # Without this the ion becomes a residue - and when AlphaFold3 writes a
+        # ligand on its own chain, a legitimate monomer gets refused as a
+        # multimer. The PDB reader filters on the ATOM record for the same
+        # reason.
+        if row.get("group_PDB", "ATOM") != "ATOM":
+            continue
         if row.get("label_atom_id") != "CA":
             continue
 

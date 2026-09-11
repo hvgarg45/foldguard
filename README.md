@@ -101,7 +101,7 @@ cd foldguard
 pip install -e .
 ```
 
-Pure standard library. No dependencies.
+Pure standard library. No dependencies. Tested on Python 3.9 and 3.13.
 
 ## Usage
 
@@ -144,6 +144,8 @@ The defaults follow common practice, not consensus — there is no universally a
 | `--pae-min-run` | 3 | consecutive such residues before a region is flagged; shorter runs are noise |
 | `--pae-min-core` | 10 | confident residues needed outside the site before its placement can be judged at all |
 
+Three independent guards decide whether placement is reported as consistent: a contiguous run above the cutoff, the pooled mean above the cutoff, and the *share* of core residues above it (15%). The third exists because uncertainty that is scattered rather than clustered clears the first, and if it is mild it never moves the second — half the core could sit above the cutoff and still be called consistent. All three values must be positive and finite: `--pae-cutoff nan` would otherwise make every comparison false, disabling the check while reporting it as passed.
+
 **Loosening them has a cost, and it is worth seeing.** On the real p53 model, the tetramerization domain sits 19 Å from the DNA-binding domain — a 21-residue run:
 
 ```bash
@@ -165,7 +167,7 @@ The tool's value is not the specific numbers. It is that the check happens at al
 pytest tests/ -q
 ```
 
-99 tests. The ones that matter are at the bottom of `tests/test_foldguard.py`: they encode the failure modes this exists to catch — a globally confident model with a weak pocket must fail for docking and pass for fold description, and a PAE check that cannot run must warn rather than pass silently.
+111 tests. The ones that matter are at the bottom of `tests/test_foldguard.py`: they encode the failure modes this exists to catch — a globally confident model with a weak pocket must fail for docking and pass for fold description, and a PAE check that cannot run must warn rather than pass silently.
 
 ## Validated against real models
 
@@ -173,7 +175,7 @@ Checked against AlphaFold DB v6 downloads rather than only synthetic fixtures: *
 
 The multi-domain check earns its keep there. Asked about the R273 hotspot mutation, FoldGuard reports:
 
-> 26 of 206 pLDDT 90+ core residues sit above 5.0 Å PAE from the site: **328-348 (21 res, mean PAE 19.0 Å)**. The pooled mean is only 4.2 Å, so an averaged check would have missed this.
+> 26 of 206 pLDDT 90+ core residues sit above 5.0 Å PAE from the site: **328-348 (21 res, mean PAE 19.0 Å)**; 224-228 (5 res, mean PAE 7.2 Å). The pooled mean is only 4.2 Å, so an averaged check would have missed this.
 
 Residues 328–348 are the tetramerization domain; R273 is in the DNA-binding domain. AlphaFold genuinely cannot place the two relative to each other, and the pooled mean — 4.2 Å, under the cutoff — hides it completely.
 

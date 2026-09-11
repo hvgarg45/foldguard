@@ -12,6 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+import math
+
 from .core import CONFIDENT, DISORDER_THRESHOLD, VERY_HIGH, Structure, Region
 
 
@@ -96,6 +98,11 @@ MIN_PAE_CORE = 10
 # Runs shorter than this are treated as noise rather than a detached region.
 PAE_MIN_RUN = 3
 
+# Uncertainty that is scattered rather than contiguous clears the run filter,
+# and if it is mild enough it never moves the pooled mean either. Above this
+# share of the core exceeding the cutoff, say so regardless of its shape.
+PAE_MAX_OVER_FRACTION = 0.15
+
 
 def _disorder_findings(
     structure: Structure, present: list[int], rules: dict
@@ -132,6 +139,25 @@ def _disorder_findings(
                 f"means nothing - and this is the region you said you care about.",
             )
         )
+
+    if not site_set:
+        # No region was named, so neither "inside" nor "elsewhere" means
+        # anything. Report the disorder plainly and let the missing-site
+        # warning carry the verdict.
+        total = sum(r.length for r in regions)
+        pct = total / structure.n_residues
+        listed = "; ".join(str(r) for r in regions[:3])
+        more = f" (+{len(regions) - 3} more)" if len(regions) > 3 else ""
+        return [
+            Finding(
+                Level.WARN,
+                "Disordered regions, with no site given to judge them against",
+                f"{len(regions)} run(s) below pLDDT {DISORDER_THRESHOLD:.0f} "
+                f"covering {pct:.0%} of the model: {listed}{more}. Whether this "
+                "matters depends entirely on where you intend to work, which "
+                "has not been specified.",
+            )
+        ]
 
     if outside:
         total = sum(r.length for r in outside)
@@ -242,6 +268,23 @@ def _pae_finding(
             "arrangement is not; treat cross-region geometry as unreliable.",
         )
 
+    over = [j for j, v in profile.items() if v > pae_cutoff]
+    over_fraction = len(over) / len(profile)
+    if segments is not None and not segments and over_fraction > PAE_MAX_OVER_FRACTION:
+        # Scattered excess clears the contiguity filter, and if it is mild it
+        # never moves the pooled mean either - so without this it slipped past
+        # both guards and returned PASS.
+        return Finding(
+            Level.WARN,
+            "Site position relative to the model is uncertain",
+            f"{len(over)} of {len(profile)} {core_bar} core residues "
+            f"({over_fraction:.0%}) exceed {pae_cutoff:.1f} A PAE from the site, "
+            "but the excess is scattered rather than contiguous, so no single "
+            f"region stands out and the pooled mean ({pooled:.1f} A) stays under "
+            "the cutoff. Diffuse uncertainty is harder to reason about than a "
+            "detached domain, not safer.",
+        )
+
     if pooled > pae_cutoff:
         # No run survived the noise filter, but the average is still over the
         # line. Reporting PASS here printed a pooled mean above the cutoff
@@ -257,13 +300,24 @@ def _pae_finding(
             "not safer.",
         )
 
-    return Finding(
-        Level.PASS,
-        "Site placement relative to core is consistent",
-        f"No run of {core_bar} core residues exceeds {pae_cutoff:.1f} A PAE from "
-        f"the site. Worst single residue is {worst_res} at "
-        f"{profile[worst_res]:.1f} A; pooled mean {pooled:.1f} A.",
-    )
+    if over:
+        # Some residues do exceed the cutoff; they were suppressed as noise by
+        # the caller's own --pae-min-run setting. Say so rather than claiming
+        # nothing exceeded - a PASS must not contradict its own numbers.
+        detail = (
+            f"{len(over)} of {len(profile)} {core_bar} core residues exceed "
+            f"{pae_cutoff:.1f} A PAE from the site (worst is {worst_res} at "
+            f"{profile[worst_res]:.1f} A), but none form a run of {min_run} or "
+            f"more consecutive residues and the pooled mean is {pooled:.1f} A. "
+            f"Lower --pae-min-run to have them flagged."
+        )
+    else:
+        detail = (
+            f"No {core_bar} core residue exceeds {pae_cutoff:.1f} A PAE from the "
+            f"site. Worst is {worst_res} at {profile[worst_res]:.1f} A; pooled "
+            f"mean {pooled:.1f} A."
+        )
+    return Finding(Level.PASS, "Site placement relative to core is consistent", detail)
 
 
 def assess(
@@ -277,6 +331,12 @@ def assess(
     """Produce a task-specific verdict on a predicted structure."""
     if task not in TASK_RULES:
         raise ValueError(f"Unknown task '{task}'. Choose from {sorted(TASK_RULES)}.")
+    if not math.isfinite(pae_cutoff) or pae_cutoff <= 0:
+        # Every `value > cutoff` comparison is False against NaN, which disables
+        # the segment detector and the pooled backstop at once and returns PASS.
+        raise ValueError(
+            f"pae_cutoff must be a positive finite number, got {pae_cutoff!r}."
+        )
 
     rules = TASK_RULES[task]
     findings: list[Finding] = []
@@ -398,6 +458,16 @@ def assess(
                 )
 
     else:
+        if structure.has_pae():
+            findings.append(
+                Finding(
+                    Level.WARN,
+                    "PAE supplied but there is no site to judge placement against",
+                    "The matrix was read and validated, but PAE answers the "
+                    "question 'is this region placed correctly relative to the "
+                    "rest?', which needs a region. Re-run with --site to use it.",
+                )
+            )
         findings.append(
             Finding(
                 Level.WARN,

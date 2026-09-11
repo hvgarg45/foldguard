@@ -460,7 +460,7 @@ def test_cli_on_a_dimer_is_bad_input_and_names_the_chains(tmp_path, capsys):
     path = make_multichain_pdb(tmp_path, {"A": [95.0] * 30, "B": [20.0] * 30})
     assert cli.main([str(path), "--task", "docking", "--site", "10-12"]) == 3
     err = capsys.readouterr().err
-    assert "A" in err and "B" in err
+    assert "(A, B)" in err, err
 
 
 def test_single_chain_models_are_unaffected(tmp_path):
@@ -840,11 +840,22 @@ def test_json_records_the_thresholds_used(tmp_path, capsys):
 
 
 @pytest.mark.parametrize("flag,value", [("--pae-min-run", "0"), ("--pae-min-run", "-1"),
-                                        ("--pae-min-core", "0"), ("--pae-cutoff", "-2")])
+                                        ("--pae-min-core", "0"), ("--pae-cutoff", "-2"),
+                                        ("--pae-cutoff", "nan"), ("--pae-cutoff", "inf"),
+                                        ("--pae-cutoff", "-inf")])
 def test_nonsense_threshold_values_are_rejected(tmp_path, flag, value):
+    """Rejected either by our own check or by argparse; both must give exit 3.
+
+    "-inf" parses as an option rather than a value, so argparse intercepts it
+    before our validation runs and raises SystemExit(3) via the _Parser
+    subclass instead of returning.
+    """
     import foldguard.cli as cli
     path = make_pdb(tmp_path, [95.0] * 20)
-    assert cli.main([str(path), "--site", "1-5", flag, value]) == 3
+    try:
+        assert cli.main([str(path), "--site", "1-5", flag, value]) == 3
+    except SystemExit as exc:
+        assert exc.code == 3
 
 
 @pytest.mark.parametrize("bad", [["--task", "nonsense"],
@@ -860,3 +871,105 @@ def test_usage_errors_are_bad_input_not_a_failed_verdict(tmp_path, bad):
     with pytest.raises(SystemExit) as exc:
         cli.main([str(path)] + bad)
     assert exc.value.code == 3
+
+
+# ---------- found by code review ----------
+
+def test_non_finite_cutoff_cannot_disable_the_pae_check():
+    """NaN defeats every `>` comparison, silently neutering both guards."""
+    n = 40
+    res = [Residue(i, "ALA", "A", 95.0) for i in range(1, n + 1)]
+    mat = [[30.0] * n for _ in range(n)]
+    s = Structure(res, "t", pae=mat)
+    with pytest.raises(ValueError, match="finite"):
+        assess(s, task="docking", site=[1, 2, 3], pae_cutoff=float("nan"))
+
+
+def test_scattered_pae_excess_is_not_reported_as_consistent():
+    """Half the core over the cutoff, but non-contiguous and the mean stays under.
+
+    The run filter needs contiguity and the pooled guard needs the average to
+    cross; uncertainty that is neither slipped past both and returned PASS
+    while printing a worst residue above the cutoff.
+    """
+    n = 300
+    res = [Residue(i, "ALA", "A", 95.0) for i in range(1, n + 1)]
+    mat = [[0.5] * n for _ in range(n)]
+    for j in range(3, n):
+        if j % 2 == 0:
+            for si in (0, 1, 2):
+                mat[si][j] = mat[j][si] = 8.0
+    report = assess(Structure(res, "t", pae=mat), task="docking", site=[1, 2, 3])
+    assert report.verdict is not Level.PASS
+    pae = [f for f in report.findings if "placement" in f.title or "relative" in f.title]
+    assert pae and pae[0].level is Level.WARN
+
+
+def test_a_pass_never_claims_nothing_exceeded_when_something_did():
+    """A lone outlier is suppressed by --pae-min-run, which is that flag's job.
+
+    The verdict stays PASS, but the finding must not claim "no core residue
+    exceeds the cutoff" while an outlier sits above it - that is the
+    contradiction, not the PASS itself.
+    """
+    n = 300
+    res = [Residue(i, "ALA", "A", 95.0) for i in range(1, n + 1)]
+    mat = [[0.5] * n for _ in range(n)]
+    for i in range(n):
+        mat[i][199] = mat[199][i] = 95.0
+    report = assess(Structure(res, "t", pae=mat), task="docking", site=[1, 2, 3])
+    pae = [f for f in report.findings if "placement" in f.title or "relative" in f.title][0]
+    assert pae.level is Level.PASS
+    assert "No" not in pae.detail.split(".")[0], pae.detail
+    assert "exceed" in pae.detail and "95.0 A" in pae.detail
+
+
+def test_cif_hetatm_ligands_are_not_parsed_as_residues(tmp_path):
+    """A calcium ion has label_atom_id 'CA', exactly like an alpha carbon."""
+    rows = [["ATOM", i, "CA", "ALA", "A", i, "A", i, 0.0, 0.0, 0.0, 1.0, 95.0]
+            for i in (1, 2, 3)]
+    rows.append(["HETATM", 4, "CA", "CA", "A", ".", "A", 200, 0.0, 0.0, 0.0, 1.0, 95.0])
+    s = parse_structure(make_cif(tmp_path, CIF_HEADERS, rows))
+    assert [r.number for r in s.residues] == [1, 2, 3]
+
+
+def test_a_ligand_on_its_own_chain_does_not_trigger_the_multimer_refusal(tmp_path):
+    """AlphaFold3 writes ligands as separate chains; that is not a multimer."""
+    rows = [["ATOM", i, "CA", "ALA", "A", i, "A", i, 0.0, 0.0, 0.0, 1.0, 95.0]
+            for i in (1, 2, 3)]
+    rows.append(["HETATM", 4, "CA", "CA", "B", ".", "B", 200, 0.0, 0.0, 0.0, 1.0, 95.0])
+    assert parse_structure(make_cif(tmp_path, CIF_HEADERS, rows)).n_residues == 3
+
+
+def test_non_finite_plddt_is_refused():
+    """_validate_pae rejects NaN; _validate_plddt must match, or --json emits NaN."""
+    res = [Residue(i, "ALA", "A", 95.0) for i in range(1, 21)]
+    res[5] = Residue(6, "ALA", "A", float("nan"))
+    with pytest.raises(ParseError, match="not a number|finite"):
+        Structure(res, "t")
+
+
+def test_json_output_is_always_valid_json(tmp_path, capsys):
+    import foldguard.cli as cli
+    path = make_pdb(tmp_path, [95.0] * 20)
+    cli.main([str(path), "--json", "--site", "1-5"])
+    out = capsys.readouterr().out
+    assert "NaN" not in out and "Infinity" not in out
+    json.loads(out)
+
+
+def test_disorder_without_a_site_does_not_claim_anything_about_a_site():
+    res = [Residue(i, "ALA", "A", 95.0) for i in range(1, 101)]
+    for i in range(66, 101):
+        res[i - 1] = Residue(i, "ALA", "A", 25.0)
+    report = assess(Structure(res, "t"), task="fold")
+    d = [f for f in report.findings if "isorder" in f.title]
+    assert d, "expected a disorder finding"
+    assert "overlap" not in d[0].detail.lower()
+    assert "elsewhere" not in d[0].title.lower()
+
+
+def test_pae_supplied_without_a_site_is_reported_as_unused():
+    res = [Residue(i, "ALA", "A", 95.0) for i in range(1, 51)]
+    report = assess(Structure(res, "t", pae=[[0.5] * 50 for _ in range(50)]), task="fold")
+    assert any("PAE" in f.title for f in report.findings), [f.title for f in report.findings]

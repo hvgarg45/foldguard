@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -121,7 +122,9 @@ def _print_json(report, thresholds: dict | None = None) -> None:
         # a pipeline log cannot be checked against the thresholds it used.
         "thresholds": thresholds or {},
     }
-    print(json.dumps(payload, indent=2))
+    # allow_nan=False: NaN/Infinity are not valid JSON, and a consumer using
+    # jq, Go or Rust would fail to parse output Python itself accepts.
+    print(json.dumps(payload, indent=2, allow_nan=False))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -189,8 +192,13 @@ def main(argv: list[str] | None = None) -> int:
         ("--pae-min-run", args.pae_min_run),
         ("--pae-min-core", args.pae_min_core),
     ):
-        if value <= 0:
-            print(f"foldguard: {name} must be positive (got {value})", file=sys.stderr)
+        if not math.isfinite(value) or value <= 0:
+            # NaN defeats every `>` comparison, which would silently disable the
+            # check this threshold controls and report it as passed.
+            print(
+                f"foldguard: {name} must be a positive finite number (got {value})",
+                file=sys.stderr,
+            )
             return EXIT_BAD_INPUT
 
     try:
@@ -233,6 +241,7 @@ def main(argv: list[str] | None = None) -> int:
                     "pae_min_core": args.pae_min_core,
                     "site_mean": TASK_RULES[args.task]["site_mean"],
                     "global_trustworthy": TASK_RULES[args.task]["global_trustworthy"],
+                    "disorder_in_site": TASK_RULES[args.task]["disorder_in_site"].value,
                 },
             )
         else:
@@ -242,8 +251,15 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.flush()
     except BrokenPipeError:
         # The consumer stopped reading (`foldguard ... | head`). Point stdout at
-        # devnull so the shutdown flush cannot fail as well.
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        # devnull so the shutdown flush cannot fail as well. This is best-effort:
+        # sys.stdout may not wrap a real fd, and letting that escape would exit 1,
+        # which is WARN - the one remaining exception path into the verdict range.
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+            os.close(devnull)
+        except Exception:  # noqa: BLE001
+            pass
         return EXIT_INTERNAL
     except Exception as exc:  # noqa: BLE001 - output must not fake a verdict
         print(
