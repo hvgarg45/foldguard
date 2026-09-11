@@ -264,6 +264,18 @@ def attach_pae(structure: Structure, path: str | Path) -> Structure:
     )
 
 
+def mean_site_plddt(structure: "Structure", site: list[int]) -> float:
+    """Mean pLDDT across the requested site residues."""
+    by_num = structure.by_number()
+    total = 0.0
+    count = 0
+    for number in site:
+        residue = by_num.get(number)
+        total += residue.plddt
+        count += 1
+    return total / count
+
+
 def parse_site(spec: str) -> list[int]:
     """Parse a residue selection like '45-52,88,120-124' into residue numbers."""
     out: list[int] = []
