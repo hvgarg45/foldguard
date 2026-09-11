@@ -949,7 +949,24 @@ def test_non_finite_plddt_is_refused():
         Structure(res, "t")
 
 
-def test_json_output_is_always_valid_json(tmp_path, capsys):
+def test_json_encoder_refuses_to_emit_nan(capsys):
+    """The second layer, tested by bypassing the first.
+
+    _validate_plddt now rejects non-finite pLDDT, so NaN cannot reach the
+    encoder by the normal route - which is exactly why this needs to mutate a
+    residue after construction. The risk allow_nan=False guards is a future
+    code path producing NaN downstream of validation; Python's json emits a
+    bare NaN token that jq, Go and Rust all reject.
+    """
+    import foldguard.cli as cli
+    s = Structure([Residue(i, "ALA", "A", 95.0) for i in range(1, 21)], "t")
+    s.residues[0].plddt = float("nan")          # bypasses __post_init__
+    report = assess(s, task="fold", site=[2, 3])
+    with pytest.raises(ValueError, match="[Nn]a[Nn]"):
+        cli._print_json(report, {})
+
+
+def test_json_output_parses_on_a_normal_model(tmp_path, capsys):
     import foldguard.cli as cli
     path = make_pdb(tmp_path, [95.0] * 20)
     cli.main([str(path), "--json", "--site", "1-5"])
@@ -973,3 +990,34 @@ def test_pae_supplied_without_a_site_is_reported_as_unused():
     res = [Residue(i, "ALA", "A", 95.0) for i in range(1, 51)]
     report = assess(Structure(res, "t", pae=[[0.5] * 50 for _ in range(50)]), task="fold")
     assert any("PAE" in f.title for f in report.findings), [f.title for f in report.findings]
+
+
+def test_unreadable_ca_records_are_refused_not_silently_dropped(tmp_path):
+    """A truncated file otherwise yields a confident verdict on a short model.
+
+    Worse, when the dropped records sit under the site, the resulting FAIL
+    blames residue numbering - "predicted models are often renumbered from 1" -
+    which sends the user looking in entirely the wrong place.
+    """
+    lines = [
+        f"ATOM  {i*5:5d}  CA  ALA A{i:4d}    "
+        f"{0.0:8.3f}{0.0:8.3f}{0.0:8.3f}  1.00{95.0:6.2f}           C"
+        for i in range(1, 101)
+    ]
+    lines[89:] = [ln[:40] for ln in lines[89:]]          # records 90-100 truncated
+    path = tmp_path / "partial.pdb"
+    path.write_text("\n".join(lines) + "\n")
+    with pytest.raises(ParseError, match="could not be read|unreadable"):
+        parse_structure(path)
+
+
+def test_intact_files_are_not_affected_by_the_dropped_record_check(tmp_path):
+    path = make_pdb(tmp_path, [95.0] * 30)
+    assert parse_structure(path).n_residues == 30
+
+
+def test_assigning_pae_after_construction_is_validated():
+    """core.py claims a Structure holding a matrix always holds a usable one."""
+    s = Structure([Residue(i, "ALA", "A", 95.0) for i in range(1, 51)], "t")
+    with pytest.raises(ParseError, match="3x3.*50 residues"):
+        s.pae = [[0.1] * 3 for _ in range(3)]

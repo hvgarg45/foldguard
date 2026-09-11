@@ -131,6 +131,8 @@ Accepts `.pdb` and `.cif` from AlphaFold2, AlphaFold3, ColabFold, ESMFold, or an
 | Every pLDDT `0.00` | The signature of a misaligned B-factor column |
 | Every pLDDT `≤ 1.0` | pLDDT written on a 0–1 scale, not 0–100 |
 | Any pLDDT outside `0–100` | Whatever that column holds, it is not pLDDT |
+| Any pLDDT that is NaN | Comparisons against it are all false, so every threshold would pass |
+| Unreadable `CA` records | A truncated file would otherwise yield a verdict on a quietly shorter model |
 
 For `.cif`, residue numbers come from `auth_seq_id` — the numbering you read off a paper or a PDB entry — falling back to `label_seq_id` only when it is absent.
 
@@ -167,7 +169,7 @@ The tool's value is not the specific numbers. It is that the check happens at al
 pytest tests/ -q
 ```
 
-111 tests. The ones that matter are at the bottom of `tests/test_foldguard.py`: they encode the failure modes this exists to catch — a globally confident model with a weak pocket must fail for docking and pass for fold description, and a PAE check that cannot run must warn rather than pass silently.
+115 tests. The ones that matter are at the bottom of `tests/test_foldguard.py`: they encode the failure modes this exists to catch — a globally confident model with a weak pocket must fail for docking and pass for fold description, and a PAE check that cannot run must warn rather than pass silently.
 
 ## Validated against real models
 

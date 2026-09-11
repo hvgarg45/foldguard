@@ -177,9 +177,20 @@ class Structure:
             )
 
         if self.pae is not None:
-            # Validate here as well as in attach_pae, so that a Structure holding
-            # a PAE matrix always holds a usable one however it was built.
-            self.pae = _validate_pae(self.pae, len(self.residues), self.source)
+            # Re-assign so __setattr__ validates it; see the note there.
+            self.pae = self.pae
+
+    def __setattr__(self, name: str, value) -> None:
+        """Validate a PAE matrix however it arrives.
+
+        attach_pae and the constructor both validate, but `structure.pae = m`
+        bypassed both - so the guarantee that a Structure holding a matrix
+        holds a usable one was not actually true. Validating here makes it so,
+        for every assignment path at once.
+        """
+        if name == "pae" and value is not None and "residues" in self.__dict__:
+            value = _validate_pae(value, len(self.residues), self.source)
+        super().__setattr__(name, value)
 
     @property
     def mean_plddt(self) -> float:
@@ -367,6 +378,7 @@ def _parse_pdb(text: str, source: str) -> list[Residue]:
     seen: dict[tuple[str, int], Residue] = {}
     insertion_codes: list[str] = []
     n_models = 0
+    unreadable = 0
 
     for line in text.splitlines():
         if line.startswith("MODEL "):
@@ -393,6 +405,11 @@ def _parse_pdb(text: str, source: str) -> list[Residue]:
             number = int(line[22:26])
             plddt = float(line[60:66])
         except (ValueError, IndexError):
+            # Dropping these silently yields a confident verdict on a model
+            # that is quietly shorter than the file claims - and if the lost
+            # residues sit under the site, the resulting "not found" FAIL
+            # blames residue numbering instead of the truncation.
+            unreadable += 1
             continue
         icode = line[26:27].strip()
         if icode:
@@ -408,6 +425,13 @@ def _parse_pdb(text: str, source: str) -> list[Residue]:
             "not a unique identity - 100, 100A and 100B are three residues that "
             "would collapse into one - so FoldGuard refuses rather than "
             "silently dropping them. Renumber sequentially first."
+        )
+    if unreadable:
+        raise ParseError(
+            f"{unreadable} CA record(s) in {source} could not be read: the "
+            "residue number or the B-factor column did not parse. The file is "
+            "likely truncated or malformed. Continuing would report a verdict "
+            "on a model quietly shorter than the file describes."
         )
     return list(seen.values())
 
